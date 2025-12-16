@@ -25,9 +25,10 @@
             </intent-filter>
         </activity>
         <activity
-            android:name=".QrScanActivity"
+            android:name="com.nomadwallet.balancebridge.QrScanActivity"
             android:exported="false"
-            android:screenOrientation="portrait" />
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.AppCompat.Light.NoActionBar" />
     </application>
 
 </manifest>
