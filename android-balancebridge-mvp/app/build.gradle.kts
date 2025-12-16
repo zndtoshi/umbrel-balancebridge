@@ -62,6 +62,9 @@ implementation("androidx.camera:camera-view:1.3.2")
 // ML Kit QR
 implementation("com.google.mlkit:barcode-scanning:17.2.0")
 
+// Nostr SDK
+implementation("org.rust-nostr:nostr-sdk:0.44.1")
+
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

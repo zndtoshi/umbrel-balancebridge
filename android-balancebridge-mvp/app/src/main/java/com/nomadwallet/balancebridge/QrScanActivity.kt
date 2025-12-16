@@ -105,14 +105,18 @@ class QrScanActivity : AppCompatActivity() {
             barcodeScanner.process(image)
                 .addOnSuccessListener { barcodes ->
                     for (barcode in barcodes) {
-                        if (barcode.format == Barcode.FORMAT_QR_CODE) {
-                            val rawValue = barcode.rawValue
-                            if (rawValue != null && !isProcessing) {
-                                isProcessing = true
-                                handleScannedQR(rawValue)
+                        when (barcode.valueType) {
+                            Barcode.TYPE_TEXT -> {
+                                val rawValue = barcode.rawValue
+                                if (rawValue != null && !isProcessing) {
+                                    isProcessing = true
+                                    handleScannedQR(rawValue)
+                                }
+                            }
+                            else -> {
+                                // Ignore non-text barcodes
                             }
                         }
-
                     }
                     imageProxy.close()
                 }
