@@ -7,7 +7,8 @@ data class PairingData(
     val version: Int = 1,
     val app: String = "umbrel-balancebridge",
     val nodePubkey: String,
-    val relays: List<String>
+    val relays: List<String>,
+    val nodeUrl: String? = null
 ) {
     companion object {
         fun fromJson(jsonString: String): PairingData? {
@@ -49,7 +50,15 @@ data class PairingData(
                     return null
                 }
                 
-                PairingData(version, app, nodePubkey, relays)
+                // Extract nodeUrl from JSON if present, otherwise use first relay as fallback
+                val nodeUrl = if (json.has("nodeUrl")) {
+                    json.getString("nodeUrl")
+                } else {
+                    // Try to extract HTTP URL from first relay if it's an HTTP endpoint
+                    relays.firstOrNull()?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+                }
+                
+                PairingData(version, app, nodePubkey, relays, nodeUrl)
             } catch (e: Exception) {
                 null
             }

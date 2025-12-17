@@ -12,6 +12,7 @@ object PairingStore {
     private const val KEY_APP = "app"
     private const val KEY_NODE_PUBKEY = "node_pubkey"
     private const val KEY_RELAYS = "relays"
+    private const val KEY_NODE_URL = "node_url"
 
     fun initialize(context: Context) {
         this.context = context.applicationContext
@@ -48,6 +49,7 @@ object PairingStore {
         val version = prefs.getInt(KEY_VERSION, 1)
         val app = prefs.getString(KEY_APP, "umbrel-balancebridge") ?: "umbrel-balancebridge"
         val relaysJson = prefs.getString(KEY_RELAYS, "[]") ?: "[]"
+        val nodeUrl = prefs.getString(KEY_NODE_URL, null)
         
         try {
             val relaysArray = JSONArray(relaysJson)
@@ -57,7 +59,7 @@ object PairingStore {
             }
             
             if (relays.isNotEmpty()) {
-                pairingData = PairingData(version, app, nodePubkey, relays)
+                pairingData = PairingData(version, app, nodePubkey, relays, nodeUrl)
             }
         } catch (e: Exception) {
             // Invalid stored data, clear it
@@ -75,6 +77,9 @@ object PairingStore {
             putString(KEY_NODE_PUBKEY, data.nodePubkey)
             val relaysArray = JSONArray(data.relays)
             putString(KEY_RELAYS, relaysArray.toString())
+            if (data.nodeUrl != null) {
+                putString(KEY_NODE_URL, data.nodeUrl)
+            }
             apply()
         }
     }

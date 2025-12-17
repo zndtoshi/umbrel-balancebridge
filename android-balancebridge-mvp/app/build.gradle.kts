@@ -65,6 +65,9 @@ implementation("com.google.mlkit:barcode-scanning:17.2.0")
 // Nostr SDK
 implementation("org.rust-nostr:nostr-sdk:0.44.1")
 
+// OkHttp for HTTP requests
+implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
