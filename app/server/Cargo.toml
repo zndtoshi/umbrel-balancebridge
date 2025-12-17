@@ -38,11 +38,21 @@ qrcode = "=0.12.0"
 bitcoin = { version = "0.32", features = ["std", "base64"] }
 bip32 = "0.5"
 
-# HTTP client for Electrs
-reqwest = { version = "0.12", features = ["json"] }
+# Electrum client for Electrs (TCP)
+electrum-client = "0.21"
 
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
+
+# Force base64ct to stable version (avoids edition2024 requirement)
+base64ct = "<1.8"
+
+# TLS/crypto providers (force ring, disable aws-lc-rs)
+rustls = { version = "0.23", features = ["ring"], default-features = false }
+tokio-rustls = { version = "0.26", features = ["ring"], default-features = false }
+
+[features]
+default = []
 
 
 [dev-dependencies]

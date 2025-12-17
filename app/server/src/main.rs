@@ -1,15 +1,17 @@
 use anyhow::{Context, Result};
+use rustls::crypto::ring::default_provider;
 use tracing::{error, info, warn};
 
 use axum::{
-    routing::get,
+    routing::{get, post},
     Router,
     response::{IntoResponse, Response},
     http::{StatusCode, header},
+    extract::Json,
 };
 use tokio::net::TcpListener;
 use std::net::SocketAddr;
-use reqwest::Client as HttpClient;
+use std::sync::Arc;
 
 mod config;
 mod error;
@@ -22,8 +24,14 @@ mod nostr_handler;
 mod electrs;
 mod xpub;
 
+fn install_crypto_provider() {
+    // Safe to call once; ignore error if already installed
+    let _ = default_provider().install_default();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -76,19 +84,49 @@ async fn main() -> Result<()> {
         }
     });
 
-    // HTTP server for pairing QR code
-    let electrs_url = std::env::var("ELECTRS_URL")
-        .unwrap_or_else(|_| "http://electrs:3002".to_string());
-    
+    // Initialize Electrs client
+    info!("Initializing Electrs client...");
+    let electrs_client = Arc::new(electrs::ElectrsClient::new().await
+        .context("Failed to initialize Electrs client")?);
+    info!("Electrs client initialized successfully");
+
+    let electrs_client_health = Arc::clone(&electrs_client);
+    let electrs_client_lookup = Arc::clone(&electrs_client);
+    let electrs_client_lookup_alt = Arc::clone(&electrs_client);
+
     let app = Router::new()
         .route("/", get(|| async { "BalanceBridge is running" }))
         .route("/pairing", get(move || async move { pairing_json_clone.clone() }))
         .route("/qr", get(move || async move { serve_svg(qr_svg_clone.clone()) }))
-        .route("/health", get(move || async move {
-            // Health check endpoint that also tests Electrs connectivity
-            match test_electrs_connectivity(&electrs_url).await {
-                Ok(_) => (StatusCode::OK, "OK - Electrs reachable").into_response(),
-                Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("Electrs unreachable: {}", e)).into_response(),
+        .route("/health", get(|| async {
+            info!("HTTP GET /health request received");
+            (StatusCode::OK, "OK").into_response()
+        }))
+        .route("/health/electrs", get(move || {
+            let electrs_client = Arc::clone(&electrs_client_health);
+            async move {
+                info!("HTTP GET /health/electrs request received");
+                match electrs_client.test_connectivity().await {
+                    Ok(_) => (StatusCode::OK, "OK"),
+                    Err(e) => {
+                        error!("Electrs health check failed: {}", e);
+                        (StatusCode::SERVICE_UNAVAILABLE, "Electrs unavailable")
+                    }
+                }
+            }
+        }))
+        .route("/bitcoin_lookup", post(move |body: Json<protocol::BitcoinLookupRequest>| {
+            let electrs_client = Arc::clone(&electrs_client_lookup);
+            async move {
+                info!("HTTP POST /bitcoin_lookup request received: {:?}", body.0);
+                handle_bitcoin_lookup_with_client(body.0, &electrs_client).await
+            }
+        }))
+        .route("/lookup", post(move |body: Json<protocol::BitcoinLookupRequest>| {
+            let electrs_client = Arc::clone(&electrs_client_lookup_alt);
+            async move {
+                info!("HTTP POST /lookup request received: {:?}", body.0);
+                handle_bitcoin_lookup_with_client(body.0, &electrs_client).await
             }
         }));
 
@@ -113,25 +151,182 @@ fn serve_svg(svg: String) -> Response {
         .into_response()
 }
 
-/// Test Electrs connectivity
-async fn test_electrs_connectivity(electrs_url: &str) -> Result<()> {
-    let client = HttpClient::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .context("Failed to create HTTP client")?;
 
-    // Try to reach Electrs root endpoint
-    let test_url = format!("{}/", electrs_url);
-    let response = client
-        .get(&test_url)
-        .send()
-        .await
-        .context("Failed to connect to Electrs")?;
+/// Handle Bitcoin lookup HTTP request with shared Electrs client
+async fn handle_bitcoin_lookup_with_client(
+    request: protocol::BitcoinLookupRequest,
+    electrs_client: &electrs::ElectrsClient,
+) -> Response {
+    info!("Processing Bitcoin lookup request: query={}", request.query);
 
-    if response.status().is_success() || response.status().as_u16() == 404 {
-        // 404 is OK - means Electrs is reachable but endpoint doesn't exist
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("Electrs returned status: {}", response.status()))
+    // Validate request
+    if !request.is_valid() {
+        warn!("Invalid Bitcoin lookup request: type={}, query={}",
+            request.request_type, request.query);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid request: type must be 'bitcoin_lookup' and query must not be empty"
+            })),
+        )
+            .into_response();
     }
+
+    if request.query.is_empty() {
+        warn!("Empty query in Bitcoin lookup request");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Query cannot be empty"
+            })),
+        )
+            .into_response();
+    }
+
+    // Process the query with the shared client
+    let response = match process_bitcoin_lookup(&request.query, electrs_client).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!("Bitcoin lookup failed for query '{}': {}", request.query, e);
+            error!("Electrs connection failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "electrs_unreachable",
+                    "details": e.to_string()
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    info!(
+        "Bitcoin lookup completed: query={}, confirmed={} sats, unconfirmed={} sats, tx_count={}",
+        request.query,
+        response.confirmed_balance,
+        response.unconfirmed_balance,
+        response.transactions.len()
+    );
+
+    let response_json = serde_json::to_string(&response)
+        .unwrap_or_else(|_| "{}".to_string());
+    info!("Sending HTTP response: size={} bytes", response_json.len());
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Legacy function for backward compatibility (creates its own client)
+async fn handle_bitcoin_lookup(
+    request: protocol::BitcoinLookupRequest,
+) -> Response {
+    // Create Electrs client (for backward compatibility)
+    let electrs_client = match electrs::ElectrsClient::new().await {
+        Ok(client) => client,
+        Err(e) => {
+            error!("Failed to create Electrs client: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to initialize Electrs client: {}", e)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    handle_bitcoin_lookup_with_client(request, &electrs_client).await
+}
+
+/// Process a Bitcoin lookup request (using Electrum TCP protocol)
+async fn process_bitcoin_lookup(
+    query: &str,
+    electrs_client: &electrs::ElectrsClient,
+) -> Result<protocol::BitcoinLookupResponse> {
+    let mut response = protocol::BitcoinLookupResponse::new(query.to_string());
+
+    if xpub::is_xpub(query) {
+        // Handle xpub/ypub/zpub/tpub - derive addresses and aggregate
+        info!("Processing xpub query: {}", query);
+        let addresses = xpub::derive_addresses(query, 20)
+            .context("Failed to derive addresses from xpub")?;
+        info!("Derived {} addresses from xpub (gap_limit=20)", addresses.len());
+
+        let mut total_balance = 0u64;
+        let mut all_txids = Vec::new();
+
+        for address in addresses {
+            match electrs_client.get_address_balance(&address).await {
+                Ok((confirmed, unconfirmed)) => {
+                    total_balance += confirmed + unconfirmed;
+                }
+                Err(e) => {
+                    warn!("Failed to get balance for derived address {}: {}", address, e);
+                }
+            }
+
+            match electrs_client.get_address_txs(&address).await {
+                Ok(txids) => {
+                    all_txids.extend(txids);
+                }
+                Err(e) => {
+                    warn!("Failed to get transactions for derived address {}: {}", address, e);
+                }
+            }
+        }
+
+        // Deduplicate txids
+        all_txids.sort();
+        all_txids.dedup();
+
+        info!(
+            "Electrs query completed for xpub: total_balance={} sats, tx_count={}",
+            total_balance, all_txids.len()
+        );
+
+        response.confirmed_balance = total_balance as i64;
+        response.unconfirmed_balance = 0; // Electrum doesn't distinguish confirmed/unconfirmed
+        response.transactions = all_txids
+            .into_iter()
+            .map(|txid| protocol::TransactionInfo {
+                txid,
+                timestamp: 0, // Electrum doesn't provide timestamps
+                amount: 0,    // Electrum doesn't provide amounts in history
+                confirmations: 1, // Assume confirmed if in history
+            })
+            .collect();
+    } else if xpub::is_bitcoin_address(query) {
+        // Handle single Bitcoin address
+        info!("Processing single address query: {}", query);
+
+        let (confirmed, unconfirmed) = electrs_client
+            .get_address_balance(query)
+            .await
+            .context("Failed to query Electrs for address balance")?;
+
+        let txids = electrs_client
+            .get_address_txs(query)
+            .await
+            .context("Failed to query Electrs for address transactions")?;
+
+        info!(
+            "Electrs query completed: confirmed={} sats, unconfirmed={} sats, tx_count={}",
+            confirmed, unconfirmed, txids.len()
+        );
+
+        response.confirmed_balance = confirmed as i64;
+        response.unconfirmed_balance = unconfirmed as i64;
+        response.transactions = txids
+            .into_iter()
+            .map(|txid| protocol::TransactionInfo {
+                txid,
+                timestamp: 0, // Electrum doesn't provide timestamps
+                amount: 0,    // Electrum doesn't provide amounts in history
+                confirmations: 1, // Assume confirmed if in history
+            })
+            .collect();
+    } else {
+        return Err(anyhow::anyhow!("Invalid query: not an address or xpub"));
+    }
+
+    Ok(response)
 }

@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use nostr_sdk::prelude::*;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
 use crate::electrs::ElectrsClient;
@@ -29,117 +30,158 @@ impl NostrHandler {
     ) -> Result<Self> {
         let client = Client::new(keys.clone());
 
-        // Add all relays
+        // Add all relays (continue on failure for redundancy)
+        let mut added_count = 0;
         for relay_url in &relay_urls {
-            let url = Url::parse(relay_url)
-                .with_context(|| format!("Invalid relay URL: {}", relay_url))?;
-            client.add_relay(url).await?;
-            info!("Added relay: {}", relay_url);
+            match Url::parse(relay_url) {
+                Ok(url) => {
+                    match client.add_relay(url).await {
+                        Ok(_) => {
+                            info!("Relay connected: {}", relay_url);
+                            added_count += 1;
+                        }
+                        Err(e) => {
+                            warn!("Relay failed: {} - {}", relay_url, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Invalid relay URL {}: {}", relay_url, e);
+                }
+            }
         }
 
-        // Connect to all relays
+        if added_count == 0 {
+            return Err(anyhow::anyhow!("Failed to add any relays"));
+        }
+
+        // Connect to all relays and wait for completion
         client.connect().await;
-        info!("Connected to {} relay(s)", relay_urls.len());
+        info!("Connected to {} relay(s)", added_count);
 
-        let electrs_client = ElectrsClient::new()?;
+        let electrs_client = ElectrsClient::new().await?;
 
-        Ok(Self {
+        let handler = Self {
             client,
             keys,
             pairing_manager,
             electrs_client,
-        })
+        };
+
+        // Subscribe immediately on startup (before pairing completes)
+        handler.subscribe_immediately().await?;
+
+        Ok(handler)
+    }
+
+    /// Subscribe immediately on startup (accepts events from past 60 seconds)
+    async fn subscribe_immediately(&self) -> Result<()> {
+        // Calculate timestamp for 60 seconds ago
+        let now = Timestamp::now();
+        let now_secs = now.as_secs();
+        let since_secs = now_secs.saturating_sub(60);
+        let since = Timestamp::from(since_secs);
+
+        // Create filter: kind 30078, accept events from past 60 seconds
+        // Don't filter by authors yet - accept all temporarily
+        let filter = Filter::new()
+            .kinds(vec![Kind::Custom(30078)])
+            .since(since);
+
+        self.client.subscribe(filter, None).await?;
+        info!("Subscribed to kind 30078 events (since {} seconds ago)", 60);
+        Ok(())
     }
 
     /// Start listening for events from the paired Android app
     pub async fn start_listening(&self) -> Result<()> {
-        let android_pubkey = match self.pairing_manager.get_android_pubkey()? {
-            Some(pk) => pk,
-            None => {
-                warn!("No Android app paired yet, waiting for pairing...");
-                // Still listen for pairing events
-                self.listen_for_pairing().await?;
-                return Ok(());
-            }
-        };
-
-        info!("Listening for events from Android pubkey: {}", android_pubkey.to_hex());
-
-        // Create filter for events from Android app (kind 30078, encrypted)
-        let filter = Filter::new()
-            .kinds(vec![Kind::Custom(30078)])
-            .authors(vec![android_pubkey]);
-
-        // Subscribe to events
-        self.client.subscribe(filter, None).await?;
-
-        // Get notification stream
+        // Get notification stream (subscription already active from startup)
         let mut notifications = self.client.notifications();
 
-        // Process incoming events
+        // Get paired Android pubkey (if any)
+        let android_pubkey = self.pairing_manager.get_android_pubkey()?;
+
+        if let Some(ref pk) = android_pubkey {
+            info!("Listening for events from Android pubkey: {}", pk.to_hex());
+        } else {
+            warn!("No Android app paired yet, accepting all kind 30078 events for pairing...");
+        }
+
+        // Process incoming events with reconnection handling
         loop {
             match notifications.recv().await {
                 Ok(notification) => {
                     match notification {
                         RelayPoolNotification::Event { event, .. } => {
-                            if event.pubkey == android_pubkey {
-                                if let Err(e) = self.handle_event(*event).await {
-                                    error!("Error handling event: {}", e);
+                            // Log event receipt immediately (before any validation)
+                            info!("Received Nostr event: id={}, pubkey={}", 
+                                event.id.to_hex(), event.pubkey.to_hex());
+
+                            // If paired, validate pubkey matches
+                            if let Some(ref expected_pubkey) = android_pubkey {
+                                if event.pubkey != *expected_pubkey {
+                                    warn!(
+                                        "Event from non-paired pubkey: {} (expected: {})",
+                                        event.pubkey.to_hex(),
+                                        expected_pubkey.to_hex()
+                                    );
+                                    continue;
                                 }
-                            } else {
-                                warn!(
-                                    "Received event from unexpected pubkey: {}",
-                                    event.pubkey.to_hex()
-                                );
+                            }
+
+                            // Handle event (decryption happens inside)
+                            if let Err(e) = self.handle_event(*event).await {
+                                error!("Error handling event: {}", e);
                             }
                         }
                         RelayPoolNotification::Message { .. } => {
                             // Ignore other message types
                         }
-                        _ => {}
-                    }
-                }
-                Err(e) => {
-                    error!("Error receiving notification: {}", e);
-                    // Continue listening
-                }
-            }
-        }
-    }
-
-    /// Listen for pairing events (before Android app is paired)
-    async fn listen_for_pairing(&self) -> Result<()> {
-        info!("Listening for pairing events...");
-
-        // Listen for any kind 30078 events
-        let filter = Filter::new().kinds(vec![Kind::Custom(30078)]);
-
-        self.client.subscribe(filter, None).await?;
-
-        let mut notifications = self.client.notifications();
-
-        loop {
-            match notifications.recv().await {
-                Ok(notification) => {
-                    match notification {
-                        RelayPoolNotification::Event { event, .. } => {
-                            if let Err(e) = self.handle_pairing_event(*event).await {
-                                error!("Error handling pairing event: {}", e);
-                            }
-                            // After pairing, we can break and start normal listening
-                            if self.pairing_manager.has_pairing() {
-                                return Ok(());
-                            }
+                        RelayPoolNotification::Shutdown => {
+                            warn!("Relay pool shutdown");
+                            // Continue listening - relay pool will handle reconnection
                         }
                         _ => {}
                     }
                 }
                 Err(e) => {
-                    error!("Error receiving notification: {}", e);
+                    warn!("Error receiving notification: {}", e);
+                    // Continue listening - do not exit loop
                 }
             }
         }
     }
+
+    /// Check if event is within expiration tolerance (60 seconds)
+    /// Returns Ok(()) if valid, logs warning if expired but doesn't reject
+    fn check_event_expiration(&self, event: &Event) -> Result<()> {
+        let event_time = event.created_at.as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("System time error")?
+            .as_secs();
+        
+        let delta = if now > event_time {
+            now - event_time
+        } else {
+            0
+        };
+        
+        if delta > 60 {
+            warn!(
+                "Event is {} seconds old (max 60s), but processing anyway",
+                delta
+            );
+        } else {
+            info!(
+                "Event timestamp check: created_at={}, now={}, delta={}s",
+                event_time, now, delta
+            );
+        }
+
+        Ok(())
+    }
+
 
     /// Handle a pairing event ("hello / paired")
     async fn handle_pairing_event(&self, event: Event) -> Result<()> {
@@ -176,17 +218,29 @@ impl NostrHandler {
             &pubkey_hex[0..8], 
             &pubkey_hex[pubkey_hex.len()-8..]);
         
-        info!("Received event from Android app: {} (sender: {})", 
-            event.id.to_hex(), sender_pubkey_short);
+        // Check expiration (log only, don't reject)
+        self.check_event_expiration(&event)?;
 
-        // Decrypt the event content
-        let decrypted = self
+        // Decrypt the event content (don't reject before decryption)
+        let decrypted = match self
             .keys
             .nip44_decrypt(&event.pubkey, &event.content)
             .await
-            .context("Failed to decrypt event")?;
+        {
+            Ok(msg) => msg,
+            Err(e) => {
+                warn!("Failed to decrypt event from {}: {}", sender_pubkey_short, e);
+                // If not paired, this might be a pairing event
+                if !self.pairing_manager.has_pairing() {
+                    if let Err(e) = self.handle_pairing_event(event).await {
+                        error!("Error handling pairing event: {}", e);
+                    }
+                }
+                return Ok(());
+            }
+        };
 
-        info!("Decrypted message: {}", decrypted);
+        info!("Event decrypted successfully from {}", sender_pubkey_short);
 
         // Try to parse as Bitcoin lookup request
         let request: BitcoinLookupRequest = match serde_json::from_str(&decrypted) {
@@ -212,7 +266,7 @@ impl NostrHandler {
             "unknown"
         };
 
-        info!("Processing Bitcoin lookup request from {}: type={}, query={}", 
+        info!("Bitcoin lookup started from {}: type={}, query={}", 
             sender_pubkey_short, query_type, request.query);
 
         // Process the request
@@ -234,23 +288,47 @@ impl NostrHandler {
             let addresses = derive_addresses(query, 20)?;
             info!("Derived {} addresses from xpub (gap_limit=20)", addresses.len());
 
-            let (confirmed, unconfirmed, transactions) = self
-                .electrs_client
-                .get_addresses_balance_and_txs(&addresses)
-                .await?;
+            let mut total_confirmed = 0u64;
+            let mut total_unconfirmed = 0u64;
+            let mut all_txids = Vec::new();
 
-            info!("Electrs query completed for xpub: confirmed={} sats, unconfirmed={} sats, tx_count={}", 
-                confirmed, unconfirmed, transactions.len());
+            for address in addresses {
+                match self.electrs_client.get_address_balance(&address).await {
+                    Ok((confirmed, unconfirmed)) => {
+                        total_confirmed += confirmed;
+                        total_unconfirmed += unconfirmed;
+                    }
+                    Err(e) => {
+                        warn!("Failed to get balance for derived address {}: {}", address, e);
+                    }
+                }
 
-            response.confirmed_balance = confirmed;
-            response.unconfirmed_balance = unconfirmed;
-            response.transactions = transactions
+                match self.electrs_client.get_address_txs(&address).await {
+                    Ok(txids) => {
+                        all_txids.extend(txids);
+                    }
+                    Err(e) => {
+                        warn!("Failed to get transactions for derived address {}: {}", address, e);
+                    }
+                }
+            }
+
+            // Deduplicate txids
+            all_txids.sort();
+            all_txids.dedup();
+
+            info!("Electrs query completed for xpub: confirmed={} sats, unconfirmed={} sats, tx_count={}",
+                total_confirmed, total_unconfirmed, all_txids.len());
+
+            response.confirmed_balance = total_confirmed as i64;
+            response.unconfirmed_balance = total_unconfirmed as i64;
+            response.transactions = all_txids
                 .into_iter()
-                .map(|tx| crate::protocol::TransactionInfo {
-                    txid: tx.txid,
-                    timestamp: tx.timestamp,
-                    amount: tx.amount,
-                    confirmations: tx.confirmations,
+                .map(|txid| crate::protocol::TransactionInfo {
+                    txid,
+                    timestamp: 0, // Electrum doesn't provide timestamps
+                    amount: 0,    // Electrum doesn't provide amounts in history
+                    confirmations: 1, // Assume confirmed if in history
                 })
                 .collect();
         } else if is_bitcoin_address(query) {
@@ -264,22 +342,22 @@ impl NostrHandler {
             info!("Electrs balance query completed: confirmed={} sats, unconfirmed={} sats", 
                 confirmed, unconfirmed);
 
-            let transactions = self
+            let txids: Vec<String> = self
                 .electrs_client
-                .get_address_transactions(query)
+                .get_address_txs(query)
                 .await?;
 
-            info!("Electrs transaction query completed: tx_count={}", transactions.len());
+            info!("Electrs transaction query completed: tx_count={}", txids.len());
 
-            response.confirmed_balance = confirmed;
-            response.unconfirmed_balance = unconfirmed;
-            response.transactions = transactions
+            response.confirmed_balance = confirmed as i64;
+            response.unconfirmed_balance = unconfirmed as i64;
+            response.transactions = txids
                 .into_iter()
-                .map(|tx| crate::protocol::TransactionInfo {
-                    txid: tx.txid,
-                    timestamp: tx.timestamp,
-                    amount: tx.amount,
-                    confirmations: tx.confirmations,
+                .map(|txid| crate::protocol::TransactionInfo {
+                    txid,
+                    timestamp: 0, // Electrum doesn't provide timestamps
+                    amount: 0,    // Electrum doesn't provide amounts in history
+                    confirmations: 1, // Assume confirmed if in history
                 })
                 .collect();
         } else {
