@@ -11,14 +11,22 @@ path = "src/main.rs"
 [dependencies]
 # Nostr
 nostr-sdk = "0.44"
-nostr = "0.33"
+nostr = "0.44"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
+# HTTP server
+axum = "0.7"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+log = "0.4"
+env_logger = "0.11"
+
+# Hex encoding/decoding
+hex = "0.4"
 
 # Error handling
 anyhow = "1.0"
@@ -29,8 +37,28 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # QR code generation
-qrcode = "0.14"
-image = { version = "0.24", features = ["png", "png-encoding"] }
+qrcode = "=0.12.0"
+
+# Bitcoin address and xpub handling
+bitcoin = { version = "0.32", features = ["std", "base64"] }
+bip32 = "0.5"
+
+# Electrum client for Electrs (TCP)
+electrum-client = "0.21"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Force base64ct to stable version (avoids edition2024 requirement)
+base64ct = "<1.8"
+
+# TLS/crypto providers (force ring, disable aws-lc-rs)
+rustls = { version = "0.23", features = ["ring"], default-features = false }
+tokio-rustls = { version = "0.26", features = ["ring"], default-features = false }
+
+[features]
+default = []
+
 
 [dev-dependencies]
 

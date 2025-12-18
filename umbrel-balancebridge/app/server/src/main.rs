@@ -1,75 +1,158 @@
 use anyhow::{Context, Result};
-use tracing::info;
+use rustls::crypto::ring::default_provider;
+use tracing::{error, info, warn};
+
+use axum::{
+    routing::get,
+    Router,
+    response::{IntoResponse, Response},
+    http::{StatusCode, header},
+    Json,
+};
+use tokio::net::TcpListener;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 mod config;
 mod error;
 mod identity;
 mod relays;
 mod qr;
+mod protocol;
+mod pairing;
+mod nostr_handler;
+mod electrs;
+mod xpub;
 
-/// BalanceBridge Umbrel Server
-/// 
-/// Main entry point for the server application.
-/// Handles Nostr communication with Android clients.
-/// 
-/// Features:
-/// - Connects to public Nostr relays
-/// - Uses NIP-44 encryption
-/// - Generates QR codes for pairing
-/// - Will integrate with Fulcrum/Electrs in the future
+fn install_crypto_provider() {
+    let _ = default_provider().install_default();
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
+    println!("=== BALANCEBRIDGE MAIN STARTED ===");
+
+    install_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    println!("=== BALANCEBRIDGE BUILD MARKER: trace-timeout-v2 ===");
+
     info!("BalanceBridge Umbrel Server starting...");
 
-    // Get Umbrel app data directory
-    // This is where all persistent data is stored (keys, QR codes, etc.)
     let data_dir = config::get_data_dir();
-    info!("Using Umbrel data directory: {}", data_dir.display());
-    
-    if let Some(app_id) = config::get_app_id() {
-        info!("Umbrel app ID: {}", app_id);
+    info!("Using data dir: {}", data_dir.display());
+
+    let keys = identity::load_or_create_keys();
+    let pubkey = keys.public_key().to_hex();
+    let relay_list = relays::get_relays();
+
+    // ✅ Electrs MUST be initialized before Nostr handler
+    info!("Initializing Electrs client...");
+    let electrs_client = Arc::new(
+        electrs::ElectrsClient::new()
+            .context("Failed to initialize Electrs client")?
+    );
+    info!("Electrs client initialized successfully");
+    info!("Warming up Electrs...");
+    match electrs_client.warm_up() {
+        Ok(_) => info!("Electrs warm-up successful"),
+        Err(e) => warn!("Electrs warm-up failed: {}", e),
     }
 
-    // Initialize Nostr identity
-    let identity = identity::IdentityManager::new(&data_dir)
-        .context("Failed to initialize identity")?;
-    
-    let public_key_hex = identity.public_key_hex();
-    info!("Nostr public key: {}", public_key_hex);
+    // Initialize pairing manager
+    let pairing_manager = pairing::PairingManager::new(&data_dir)
+        .context("Failed to init pairing manager")?;
 
-    // Get relay list
-    let relays = relays::get_relays();
-    info!("Using {} relay(s): {:?}", relays.len(), relays);
+    // Generate QR code for pairing
+    let payload = qr::PairingPayload::new(pubkey.clone(), relay_list.clone());
+    let pairing_json = payload.to_json()?;
+    let qr_svg = payload.generate_qr_svg()?;
 
-    // Generate pairing payload
-    let pairing_payload = qr::PairingPayload::new(public_key_hex.clone(), relays.clone());
-    let pairing_json = pairing_payload.to_json()?;
-    info!("Pairing payload: {}", pairing_json);
+    let pairing_json_clone = pairing_json.clone();
+    let qr_svg_clone = qr_svg.clone();
 
-    // Generate QR code image
-    let qr_image_data = pairing_payload.generate_qr_image(512)?;
-    let qr_path = data_dir.join("pairing_qr.png");
-    std::fs::write(&qr_path, qr_image_data)
-        .context("Failed to write QR code image")?;
-    info!("QR code saved to: {}", qr_path.display());
+    // Start Nostr handler
+    info!("Server pubkey: {}", pubkey);
+    info!("BalanceBridge request kind: {}", crate::nostr_handler::BALANCEBRIDGE_REQUEST_KIND);
+    info!("BalanceBridge response kind: {}", crate::nostr_handler::BALANCEBRIDGE_RESPONSE_KIND);
+    info!("Nostr relays: {}", relay_list.join(", "));
 
-    // TODO: Initialize Nostr relay connections
-    // TODO: Set up NIP-44 encryption
-    // TODO: Implement event handlers for Android communication
-    // TODO: Integrate with Fulcrum/Electrs
+    let nostr_task = tokio::spawn({
+        let keys_clone = keys.clone();
+        let pairing_manager_clone = pairing_manager.clone();
+        let relay_list_clone = relay_list.clone();
+        let electrs_client_clone = Arc::clone(&electrs_client);
 
-    info!("Server initialized and ready for pairing");
+        async move {
+            match nostr_handler::NostrHandler::new(
+                keys_clone,
+                pairing_manager_clone,
+                relay_list_clone,
+                electrs_client_clone,
+            )
+            .await
+            {
+                Ok(handler) => {
+                    if let Err(e) = handler.start_listening().await {
+                        eprintln!("Nostr handler exited with error: {}", e);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to start Nostr handler: {}", e);
+                }
+            }
+        }
+    });
 
-    // Keep the server running
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down...");
+    tokio::spawn(async move {
+        if let Err(e) = nostr_task.await {
+            eprintln!("Nostr task panicked: {:?}", e);
+        }
+    });
 
+    let electrs_client_health = Arc::clone(&electrs_client);
+
+    let app = Router::new()
+        .route("/", get(|| async { "BalanceBridge is running" }))
+        .route("/pairing", get(move || async move { pairing_json_clone.clone() }))
+        .route("/qr", get(move || async move { serve_svg(qr_svg_clone.clone()) }))
+        .route("/health", get(|| async {
+            info!("HTTP GET /health request received");
+            (StatusCode::OK, "OK").into_response()
+        }))
+        .route("/health/electrs", get(move || {
+            let electrs_client = Arc::clone(&electrs_client_health);
+            async move {
+                info!("HTTP GET /health/electrs request received");
+                match tokio::task::spawn_blocking(move || electrs_client.test_connectivity()).await {
+                    Ok(_) => (StatusCode::OK, "OK"),
+                    Err(e) => {
+                        error!("Electrs health check failed: {}", e);
+                        (StatusCode::SERVICE_UNAVAILABLE, "Electrs unavailable")
+                    }
+                }
+            }
+        }));
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], 3829));
+    info!("Listening on http://{}", addr);
+
+    let listener = TcpListener::bind(addr)
+        .await
+        .context("Failed to bind")?;
+
+    info!("Server ready. Waiting for Android app pairing...");
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
+fn serve_svg(svg: String) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "image/svg+xml")],
+        svg,
+    )
+        .into_response()
+}
