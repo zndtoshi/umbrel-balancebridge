@@ -1,306 +1,231 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::sync::Arc;
+use tokio::time::{timeout, Duration};
 use tracing::{error, info, warn};
 
 use crate::electrs::ElectrsClient;
+use crate::nostr::NostrState;
 use crate::pairing::PairingManager;
-use crate::xpub;
 
 pub const BALANCEBRIDGE_REQUEST_KIND: u16 = 30078;
 pub const BALANCEBRIDGE_RESPONSE_KIND: u16 = 30079;
 
-pub struct NostrHandler {
-    keys: Keys,
-    #[allow(dead_code)]
-    pairing: PairingManager,
-    relays: Vec<String>,
-    electrs: Arc<ElectrsClient>,
-}
+/* -------------------- Request / Response -------------------- */
 
-#[derive(Debug, Deserialize)]
-struct LookupRequest {
+#[derive(Debug, Serialize, Deserialize)]
+struct BitcoinLookupRequest {
     #[serde(rename = "type")]
-    typ: String,
+    req_type: String,
     query: String,
 }
 
+/*
+ Android MVP compatibility:
+ - req inside JSON
+ - legacy field names
+*/
 #[derive(Debug, Serialize)]
-struct LookupResult {
+struct BitcoinLookupResponse {
+    // Android MVP fields
+    req: String,
+    confirmedBalance: u64,
+    unconfirmedBalance: u64,
+    confirmations: u64,
+    amount: u64,
+
+    // Modern fields
     confirmed_balance: u64,
     unconfirmed_balance: u64,
-    transactions: Vec<String>,
+    transactions: Vec<TransactionInfo>,
 }
 
 #[derive(Debug, Serialize)]
-struct LookupResponse {
-    #[serde(rename = "type")]
-    typ: String,
-    status: String,
-    req: String,
-    result: Option<LookupResult>,
-    error: Option<String>,
+struct TransactionInfo {
+    txid: String,
+}
+
+/* -------------------- Handler -------------------- */
+
+pub struct NostrHandler {
+    client: Arc<Client>,
+    keys: Keys,
+    electrs_client: Arc<ElectrsClient>,
 }
 
 impl NostrHandler {
     pub async fn new(
+        nostr_state: NostrState,
         keys: Keys,
-        pairing: PairingManager,
-        relays: Vec<String>,
-        electrs: Arc<ElectrsClient>,
+        _pairing_manager: PairingManager,
+        electrs_client: Arc<ElectrsClient>,
     ) -> Result<Self> {
         Ok(Self {
+            client: nostr_state.client.clone(),
             keys,
-            pairing,
-            relays,
-            electrs,
+            electrs_client,
         })
     }
 
     pub async fn start_listening(&self) -> Result<()> {
-        info!("=== NOSTR HANDLER start_listening ===");
+        let filter = Filter::new()
+            .kinds(vec![Kind::Custom(BALANCEBRIDGE_REQUEST_KIND)]);
 
-        let client = Client::new(self.keys.clone());
-
-        for r in &self.relays {
-            let url = RelayUrl::parse(r).with_context(|| format!("Invalid relay URL: {}", r))?;
-            client.add_relay(url).await?;
-        }
-
-        client.connect().await;
-
-        let filter = Filter::new().kind(Kind::Custom(BALANCEBRIDGE_REQUEST_KIND));
-        client.subscribe(filter, None).await;
+        self.client.subscribe(filter, None).await?;
 
         info!(
-            "Subscribed to kind={} on {} relay(s)",
-            BALANCEBRIDGE_REQUEST_KIND,
-            self.relays.len()
+            "Subscribed to BalanceBridge request kind={}",
+            BALANCEBRIDGE_REQUEST_KIND
         );
 
-        let mut notifications = client.notifications();
+        let mut notifications = self.client.notifications();
 
-        loop {
-            match notifications.recv().await {
-                Ok(RelayPoolNotification::Event { event, .. }) => {
-                    if let Err(e) = self.handle_event(&client, &event).await {
-                        warn!("handle_event error: {}", e);
-                    }
+        // IMPORTANT: never exit this loop on bad events
+        while let Ok(notification) = notifications.recv().await {
+            if let RelayPoolNotification::Event { event, .. } = notification {
+                if event.kind.as_u16() != BALANCEBRIDGE_REQUEST_KIND {
+                    continue;
                 }
-                Ok(_) => {}
-                Err(e) => warn!("Nostr notifications error: {}", e),
-            }
-        }
-    }
 
-    async fn handle_event(&self, client: &Client, event: &Event) -> Result<()> {
-        if event.kind != Kind::Custom(BALANCEBRIDGE_REQUEST_KIND) {
-            return Ok(());
-        }
+                let from_pk = event.pubkey;
 
-        let server_pk_hex = self.keys.public_key().to_hex();
-        if !has_tag(event, "p", &server_pk_hex) {
-            return Ok(());
-        }
+                // 🔑 FIX: ignore events without req tag instead of crashing
+                let req_id = match extract_req_id(&event) {
+                    Some(v) => v,
+                    None => {
+                        warn!(
+                            "Ignoring BalanceBridge request without req tag (from={})",
+                            from_pk.to_hex()
+                        );
+                        continue;
+                    }
+                };
 
-        let req_id = match get_tag(event, "req") {
-            Some(v) => v,
-            None => return Ok(()),
-        };
+                let parsed: BitcoinLookupRequest =
+                    match serde_json::from_str(&event.content) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(
+                                "Invalid request JSON (from={} req={}): {}",
+                                from_pk.to_hex(),
+                                req_id,
+                                e
+                            );
+                            continue;
+                        }
+                    };
 
-        let android_pubkey = event.pubkey;
+                if parsed.req_type != "bitcoin_lookup" {
+                    continue;
+                }
 
-        let req: LookupRequest = match serde_json::from_str(&event.content) {
-            Ok(v) => v,
-            Err(_) => {
-                self.send_error(client, android_pubkey, req_id, "invalid_json".into())
-                    .await?;
-                return Ok(());
-            }
-        };
+                let address = parsed.query.clone();
 
-        if req.typ != "bitcoin_lookup" {
-            self.send_error(client, android_pubkey, req_id, "invalid_type".into())
-                .await?;
-            return Ok(());
-        }
-
-        let query = req.query.trim().to_string();
-        if query.is_empty() {
-            self.send_error(client, android_pubkey, req_id, "empty_query".into())
-                .await?;
-            return Ok(());
-        }
-
-        info!(
-            "Nostr lookup request: from={} req={} query={}",
-            android_pubkey.to_hex(),
-            req_id,
-            query
-        );
-
-        // IMPORTANT: this confirms Electrs is finished before we publish.
-        match self.perform_lookup(&query).await {
-            Ok(result) => {
                 info!(
-                    "Lookup OK: req={} from={} confirmed={} unconfirmed={} txs={}",
+                    "Nostr lookup request: from={} req={} query={}",
+                    from_pk.to_hex(),
                     req_id,
-                    android_pubkey.to_hex(),
-                    result.confirmed_balance,
-                    result.unconfirmed_balance,
-                    result.transactions.len()
+                    address
                 );
-                self.send_ok(client, android_pubkey, req_id, result).await?
-            }
-            Err(e) => {
-                error!("Lookup failed: req={} err={}", req_id, e);
-                self.send_error(client, android_pubkey, req_id, e.to_string())
-                    .await?;
+
+                if let Err(e) = self
+                    .lookup_and_publish(from_pk, &req_id, address)
+                    .await
+                {
+                    error!(
+                        "Lookup failed: from={} req={} err={}",
+                        from_pk.to_hex(),
+                        req_id,
+                        e
+                    );
+                }
             }
         }
 
         Ok(())
     }
 
-    async fn perform_lookup(&self, query: &str) -> Result<LookupResult> {
-        if xpub::is_xpub(query) {
-            let addresses =
-                xpub::derive_addresses(query, 20).context("Failed to derive addresses from xpub")?;
-
-            let mut confirmed = 0u64;
-            let mut unconfirmed = 0u64;
-            let mut txids: HashSet<String> = HashSet::new();
-
-            for addr in addresses {
-                if let Ok((c, u)) = self.electrs.get_address_balance(&addr).await {
-                    confirmed = confirmed.saturating_add(c);
-                    unconfirmed = unconfirmed.saturating_add(u);
-                }
-
-                if let Ok(txs) = self.electrs.get_address_txs(&addr).await {
-                    for t in txs {
-                        txids.insert(t);
-                    }
-                }
-            }
-
-            let mut tx_list: Vec<String> = txids.into_iter().collect();
-            tx_list.sort();
-
-            Ok(LookupResult {
-                confirmed_balance: confirmed,
-                unconfirmed_balance: unconfirmed,
-                transactions: tx_list,
-            })
-        } else if xpub::is_bitcoin_address(query) {
-            let (confirmed, unconfirmed) = self.electrs.get_address_balance(query).await?;
-
-            Ok(LookupResult {
-                confirmed_balance: confirmed,
-                unconfirmed_balance: unconfirmed,
-                transactions: Vec::new(),
-            })
-        } else {
-            Err(anyhow!("invalid_query"))
-        }
-    }
-
-    async fn send_ok(
+    async fn lookup_and_publish(
         &self,
-        client: &Client,
-        android_pubkey: PublicKey,
-        req_id: String,
-        result: LookupResult,
+        to_pubkey: PublicKey,
+        req_id: &str,
+        address: String,
     ) -> Result<()> {
-        let resp = LookupResponse {
-            typ: "bitcoin_lookup_response".into(),
-            status: "ok".into(),
-            req: req_id.clone(),
-            result: Some(result),
-            error: None,
+        let (confirmed, unconfirmed) = timeout(
+            Duration::from_secs(30),
+            self.electrs_client.get_address_balance(&address),
+        )
+        .await
+        .map_err(|_| anyhow!("Electrs balance timeout"))??;
+
+        let txids = match timeout(
+            Duration::from_secs(20),
+            self.electrs_client.get_address_txs(&address),
+        )
+        .await
+        {
+            Ok(Ok(v)) => v,
+            _ => vec![],
         };
-
-        self.publish_response(client, android_pubkey, req_id, resp).await
-    }
-
-    async fn send_error(
-        &self,
-        client: &Client,
-        android_pubkey: PublicKey,
-        req_id: String,
-        msg: String,
-    ) -> Result<()> {
-        let resp = LookupResponse {
-            typ: "bitcoin_lookup_response".into(),
-            status: "error".into(),
-            req: req_id.clone(),
-            result: None,
-            error: Some(msg),
-        };
-
-        self.publish_response(client, android_pubkey, req_id, resp).await
-    }
-
-    async fn publish_response(
-        &self,
-        client: &Client,
-        android_pubkey: PublicKey,
-        req_id: String,
-        resp: LookupResponse,
-    ) -> Result<()> {
-        let content = serde_json::to_string(&resp).context("Failed to serialize response")?;
-
-        let server_pk_hex = self.keys.public_key().to_hex();
-
-        // We include BOTH "p" tags to satisfy either client filtering style:
-        // - Some clients filter responses by their own pubkey (recipient-style)
-        // - Some mirror the request pattern and filter by server pubkey
-        let p_tag_android = Tag::parse(vec!["p".to_string(), android_pubkey.to_hex()])?;
-        let p_tag_server = Tag::parse(vec!["p".to_string(), server_pk_hex.clone()])?;
-        let req_tag = Tag::parse(vec!["req".to_string(), req_id.clone()])?;
-
-        let builder = EventBuilder::new(Kind::Custom(BALANCEBRIDGE_RESPONSE_KIND), content)
-            .tags(vec![p_tag_android, p_tag_server, req_tag]);
 
         info!(
-            "Publishing response: kind={} to={} req={} (server_pk={})",
+            "Lookup OK: req={} confirmed={} unconfirmed={} txs={}",
+            req_id,
+            confirmed,
+            unconfirmed,
+            txids.len()
+        );
+
+        let response = BitcoinLookupResponse {
+            req: req_id.to_string(),
+            confirmedBalance: confirmed,
+            unconfirmedBalance: unconfirmed,
+            confirmations: txids.len() as u64,
+            amount: confirmed + unconfirmed,
+
+            confirmed_balance: confirmed,
+            unconfirmed_balance: unconfirmed,
+            transactions: txids
+                .into_iter()
+                .map(|txid| TransactionInfo { txid })
+                .collect(),
+        };
+
+        let json = serde_json::to_string(&response)?;
+
+        let tags = vec![
+            Tag::parse(["p", to_pubkey.to_hex().as_str()])?,
+            Tag::parse(["req", req_id])?,
+        ];
+
+        let event = EventBuilder::new(
+            Kind::Custom(BALANCEBRIDGE_RESPONSE_KIND),
+            json,
+        )
+        .tags(tags)
+        .sign_with_keys(&self.keys)?;
+
+        info!(
+            "Publishing response: kind={} to={} req={}",
             BALANCEBRIDGE_RESPONSE_KIND,
-            android_pubkey.to_hex(),
-            req_id,
-            server_pk_hex
+            to_pubkey.to_hex(),
+            req_id
         );
 
-        // Log the returned event id so we know publish actually happened.
-        let event_id = client.send_event_builder(builder).await?;
-
-        info!(
-            "Published response OK: event_id={} req={} to={}",
-            event_id.to_hex(),
-            req_id,
-            android_pubkey.to_hex()
-        );
+        self.client.send_event(&event).await?;
 
         Ok(())
     }
 }
 
-fn has_tag(event: &Event, key: &str, value: &str) -> bool {
-    for t in event.tags.iter() {
-        let v = t.clone().to_vec();
-        if v.len() >= 2 && v[0] == key && v[1] == value {
-            return true;
-        }
-    }
-    false
-}
+/* -------------------- Helpers -------------------- */
 
-fn get_tag(event: &Event, key: &str) -> Option<String> {
+fn extract_req_id(event: &Event) -> Option<String> {
     for t in event.tags.iter() {
         let v = t.clone().to_vec();
-        if v.len() >= 2 && v[0] == key {
-            return Some(v[1].clone());
+        if v.len() >= 2 && v[0] == "req" {
+            return Some(v[1].to_string());
         }
     }
     None

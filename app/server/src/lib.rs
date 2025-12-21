@@ -9,6 +9,7 @@ pub mod relays;
 pub mod qr;
 pub mod pairing;
 pub mod nostr_handler;
+pub mod nostr;
 pub mod electrs;
 pub mod xpub;
 

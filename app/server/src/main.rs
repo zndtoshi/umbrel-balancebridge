@@ -21,6 +21,7 @@ mod qr;
 mod protocol;
 mod pairing;
 mod nostr_handler;
+mod nostr;
 mod electrs;
 mod xpub;
 
@@ -47,6 +48,7 @@ async fn main() -> Result<()> {
     let keys = identity::load_or_create_keys();
     let pubkey = keys.public_key().to_hex();
     let relay_list = relays::get_relays();
+    let nostr_state = nostr::NostrState::new(keys.clone(), relay_list.clone()).await?;
 
     // ✅ Electrs MUST be initialized before Nostr handler
     info!("Initializing Electrs client...");
@@ -73,6 +75,22 @@ async fn main() -> Result<()> {
     let pairing_json_clone = pairing_json.clone();
     let qr_svg_clone = qr_svg.clone();
 
+    // Spawn lightweight BalanceBridge Nostr loop (request/response)
+    {
+        let client = nostr_state.client.clone();
+        let electrs_for_nostr = Arc::clone(&electrs_client);
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) =
+                    crate::nostr::run_balancebridge_nostr_loop(client.clone(), electrs_for_nostr.clone()).await
+                {
+                    error!("BB_NOSTR: loop crashed: {e:?} — restarting in 2s");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        });
+    }
+
     // Start Nostr handler
     info!("Server pubkey: {}", pubkey);
     info!("BalanceBridge request kind: {}", crate::nostr_handler::BALANCEBRIDGE_REQUEST_KIND);
@@ -82,14 +100,14 @@ async fn main() -> Result<()> {
     let nostr_task = tokio::spawn({
         let keys_clone = keys.clone();
         let pairing_manager_clone = pairing_manager.clone();
-        let relay_list_clone = relay_list.clone();
         let electrs_client_clone = Arc::clone(&electrs_client);
+        let nostr_state_clone = nostr_state.clone();
 
         async move {
             match nostr_handler::NostrHandler::new(
+                nostr_state_clone,
                 keys_clone,
                 pairing_manager_clone,
-                relay_list_clone,
                 electrs_client_clone,
             )
             .await
@@ -114,6 +132,7 @@ async fn main() -> Result<()> {
 
     let electrs_client_health = Arc::clone(&electrs_client);
 
+    let app_state = nostr_state.clone();
     let app = Router::new()
         .route("/", get(|| async { "BalanceBridge is running" }))
         .route("/pairing", get(move || async move { pairing_json_clone.clone() }))
@@ -134,7 +153,8 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-        }));
+        }))
+        .with_state(app_state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3829));
     info!("Listening on http://{}", addr);
